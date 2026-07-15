@@ -1,0 +1,324 @@
+"""
+NSE Signal Alert Bot  v1.0
+============================
+Standalone cloud bot — no dashboard, no PC needed.
+Runs on Render.com free tier 24/7.
+
+Fetches NSE option chain directly → checks signals → sends Telegram alert.
+
+Monitors ALL F&O stocks every 3 minutes:
+  BUY  alert: CE Short Cover + PE Short Build both firing
+  SELL alert: CE Short Build + PE Short Cover both firing
+  Coil alert: Coiled Spring pre-breakout/breakdown detected
+"""
+
+import os, time, json, requests
+from datetime import datetime
+
+# ── CONFIG (set as environment variables on Render) ───────────────────────────
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN")
+TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
+SCAN_INTERVAL  = int(os.environ.get("SCAN_INTERVAL", "300"))  # 5 minutes
+
+# ── F&O Symbols to monitor ────────────────────────────────────────────────────
+FO_STOCKS = [
+    "NIFTY","BANKNIFTY","FINNIFTY","MIDCPNIFTY","NIFTYNXT50","BSE","RELIANCE","SBIN","ADANIENT","HDFCBANK",
+    "ADANIGREEN","MCX","ICICIBANK","BAJFINANCE","TCS","INFY","AXISBANK","ADANIENSOL","WIPRO","TATASTEEL",
+    "ADANIPOWER","BHARTIARTL","BHEL","VEDL","CANBK","BANKBARODA","HINDZINC","TITAN","NATIONALUM","SHRIRAMFIN",
+    "M&M","LT","HINDALCO","PFC","ULTRACEMCO","COALINDIA","BEL","ITC","SUNPHARMA","ANGELONE",
+    "DIXON","CGPOWER","ASIANPAINT","NHPC","MARUTI","SAIL","HINDUNILVR","KOTAKBANK","TMPV","NMDC",
+    "RECLTD","TRENT","NTPC","CHOLAFIN","COFORGE","INDIGO","YESBANK","AMBER","TECHM","ASHOKLEY",
+    "HEROMOTOCO","AMBUJACEM","NBCC","EICHERMOT","ADANIPORTS","INDIANB","FEDERALBNK","TVSMOTOR","HDFCAMC","RVNL",
+    "360ONE","PNB","BAJAJ-AUTO","POLYCAB","BAJAJFINSV","KAYNES","LUPIN","HCLTECH","HDFCLIFE","PATANJALI",
+    "CUMMINSIND","LAURUSLABS","UNIONBANK","GRASIM","PERSISTENT","LTF","HAL","INDUSTOWER","JSWSTEEL","IDFCFIRSTB",
+    "VMM","ONGC","POWERGRID","MOTHERSON","OFSS","DLF","AUBANK","AUROPHARMA","TORNTPHARM","NESTLEIND",
+    "VOLTAS","APLAPOLLO","BANKINDIA","ABB","MUTHOOTFIN","INDUSINDBK","VBL","LICHSGFIN","UPL","BPCL",
+    "COCHINSHIP","APOLLOHOSP","DMART","FORTIS","IOC","CIPLA","MARICO","NAUKRI","MAZDOCK","RBLBANK",
+    "CDSL","ABCAPITAL","GAIL","DIVISLAB","ICICIGI","MAXHEALTH","SBILIFE","LICI","CROMPTON","SIEMENS",
+    "BANDHANBNK","OIL","LODHA","JINDALSTEL","PRESTIGE","HINDPETRO","UNOMINDA","EXIDEIND","TATACONSUM","GLENMARK",
+    "GODREJPROP","KEI","KFINTECH","TATAPOWER","BIOCON","PNBHOUSING","LTM","ZYDUSLIFE","BOSCHLTD","DRREDDY",
+    "SONACOMS","PGEL","JSWENERGY","HAVELLS","NAM-INDIA","CONCOR","PHOENIXLTD","BRITANNIA","MPHASIS","ICICIPRULI",
+    "DABUR","PETRONET","IRFC","CAMS","BLUESTARCO","INDHOTEL","ALKEM","BHARATFORG","MANAPPURAM","TATAELXSI",
+    "PIDILITIND","BAJAJHLDNG","PAGEIND","RADICO","IEX","KPITTECH","GODREJCP","IREDA","ASTRAL","TIINDIA",
+    "GODFRYPHLP","JUBLFOOD","SHREECEM","NUVAMA","MOTILALOFS","SUPREMEIND","DALBHARAT","SRF","OBEROIRLTY","MANKIND",
+    "COLPAL","UNITDSPR","PIIND",
+]
+
+# ── NSE Headers (required to bypass NSE's bot detection) ─────────────────────
+NSE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": "https://www.nseindia.com/",
+    "Connection": "keep-alive",
+}
+
+# ── State tracking ────────────────────────────────────────────────────────────
+active_signals = {}   # sym → signal type currently active
+session = requests.Session()
+session.headers.update(NSE_HEADERS)
+
+# ── NSE cookie refresh ────────────────────────────────────────────────────────
+def refresh_nse_session():
+    try:
+        session.get("https://www.nseindia.com", timeout=10)
+        session.get("https://www.nseindia.com/market-data/live-equity-market", timeout=10)
+    except Exception as e:
+        print(f"[NSE] Session refresh error: {e}")
+
+# ── Fetch option chain for one symbol ────────────────────────────────────────
+def fetch_option_chain(sym):
+    try:
+        if sym in ["NIFTY","BANKNIFTY","FINNIFTY","MIDCPNIFTY","NIFTYNXT50"]:
+            url = f"https://www.nseindia.com/api/option-chain-indices?symbol={sym}"
+        else:
+            url = f"https://www.nseindia.com/api/option-chain-equities?symbol={sym}"
+        
+        r = session.get(url, timeout=10)
+        if r.status_code == 200:
+            return r.json()
+        return None
+    except Exception:
+        return None
+
+# ── Analyse option chain ──────────────────────────────────────────────────────
+def analyse(sym, data):
+    try:
+        rec  = data.get("records", {})
+        flt  = data.get("filtered", {})
+        rows = flt.get("data") or rec.get("data", [])
+        spot = float(rec.get("underlyingValue", 0) or 0)
+        if not spot or not rows:
+            return None
+
+        # PCR
+        ce_oi = flt.get("CE", {}).get("totOI", 0) or 0
+        pe_oi = flt.get("PE", {}).get("totOI", 0) or 0
+        if not ce_oi:
+            for row in rows:
+                ce_oi += (row.get("CE") or {}).get("openInterest", 0) or 0
+                pe_oi += (row.get("PE") or {}).get("openInterest", 0) or 0
+        pcr = round(pe_oi / ce_oi, 2) if ce_oi else 0
+
+        # Find ATM
+        atm = min(rows, key=lambda r: abs(r.get("strikePrice",0) - spot))
+        atm_strike = atm.get("strikePrice", spot)
+
+        # Check ±5 strikes near ATM
+        near = [r for r in rows
+                if abs(r.get("strikePrice",0) - atm_strike) <= 5 * 50]
+
+        ce_sc, pe_sb, ce_sb, pe_sc = [], [], [], []
+        pe_wall = 0
+
+        for row in near:
+            sp  = row.get("strikePrice", 0)
+            ce  = row.get("CE") or {}
+            pe  = row.get("PE") or {}
+            coi = ce.get("openInterest", 0) or 0
+            cch = ce.get("changeinOpenInterest", 0) or 0
+            poi = pe.get("openInterest", 0) or 0
+            pch = pe.get("changeinOpenInterest", 0) or 0
+
+            # CE tags
+            if coi > 0 and cch < 0: ce_sc.append(sp)   # CE Short Cover
+            if coi > 0 and cch > 0: ce_sb.append(sp)   # CE Short Build
+            # PE tags
+            if poi > 0 and pch > 0:
+                pe_sb.append(sp)                         # PE Short Build
+                pe_wall += 1
+            if poi > 0 and pch < 0: pe_sc.append(sp)   # PE Short Cover
+
+        # Score (simplified)
+        bull = 0; bear = 0
+        if pcr >= 1.3: bull += 3
+        elif pcr >= 1.0: bull += 1.5
+        elif pcr <= 0.7: bear += 3
+        elif pcr < 1.0: bear += 1.5
+        if ce_sc: bull += 2
+        if pe_sb: bull += 2
+        if ce_sb: bear += 2
+        if pe_sc: bear += 2
+        total = bull + bear or 1
+        score = round(bull / total * 100)
+
+        # MaxPain
+        strikes = sorted(set(r.get("strikePrice",0) for r in rows))
+        ce_map = {r.get("strikePrice",0): (r.get("CE") or {}).get("openInterest",0) or 0 for r in rows}
+        pe_map = {r.get("strikePrice",0): (r.get("PE") or {}).get("openInterest",0) or 0 for r in rows}
+        max_pain = 0
+        min_pain = float("inf")
+        for t in strikes:
+            pain = sum(max(0,(k-t))*ce_map.get(k,0) + max(0,(t-k))*pe_map.get(k,0) for k in strikes)
+            if pain < min_pain:
+                min_pain = pain; max_pain = t
+
+        mp_gap = round((spot - max_pain) / max_pain * 100, 2) if max_pain else 0
+
+        # Get S1/R1
+        top_ce = sorted(ce_map.items(), key=lambda x: -x[1])
+        top_pe = sorted(pe_map.items(), key=lambda x: -x[1])
+        r1 = top_ce[0][0] if top_ce else 0
+        s1 = top_pe[0][0] if top_pe else 0
+
+        return {
+            "sym": sym, "cmp": spot, "pcr": pcr, "score": score,
+            "maxPain": max_pain, "mpGap": mp_gap,
+            "r1": r1, "s1": s1, "peWall": pe_wall,
+            "hasCESC": bool(ce_sc), "hasPESB": bool(pe_sb),
+            "hasCESB": bool(ce_sb), "hasPESC": bool(pe_sc),
+            "ceSBCount": len(ce_sb), "peSBCount": len(pe_sb),
+        }
+    except Exception as e:
+        return None
+
+# ── Telegram send ─────────────────────────────────────────────────────────────
+def send(msg):
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT, "text": msg, "parse_mode": "HTML"},
+            timeout=10
+        )
+        return r.json().get("ok", False)
+    except Exception as e:
+        print(f"[TG] Error: {e}")
+        return False
+
+# ── Check and alert ───────────────────────────────────────────────────────────
+def check_and_alert(d):
+    sym = d["sym"]
+    now = datetime.now().strftime("%H:%M")
+
+    # ── BUY: CE-SC + PE-SB + PCR >= 1.0 + Score >= 62 ──────────────────────
+    if d["hasCESC"] and d["hasPESB"] and d["pcr"] >= 1.0 and d["score"] >= 62:
+        key = f"BULL_{sym}"
+        if active_signals.get(key) != "BULL":
+            active_signals[key] = "BULL"
+            msg = (
+                f"⚡ <b>BUY SIGNAL — {sym}</b>\n\n"
+                f"🕐 {now}  |  💰 CMP: ₹{d['cmp']}\n"
+                f"📊 PCR: {d['pcr']}  |  Score: {d['score']}/100\n"
+                f"🎯 MaxPain: ₹{d['maxPain']}  ({d['mpGap']:+.1f}%)\n"
+                f"🛡️ S1: ₹{d['s1']}  |  🎯 R1: ₹{d['r1']}\n"
+                f"🧱 PeWall: {d['peWall']} strikes\n\n"
+                f"✅ <b>CE Short Cover + PE Short Build fired</b>\n"
+                f"<i>Institutional floor confirmed</i>"
+            )
+            send(msg)
+            print(f"[ALERT] BUY — {sym} @ {d['cmp']}")
+    else:
+        active_signals.pop(f"BULL_{sym}", None)
+
+    # ── SELL: CE-SB + PE-SC + PCR <= 0.85 + Score <= 38 ────────────────────
+    if d["hasCESB"] and d["hasPESC"] and d["pcr"] <= 0.85 and d["score"] <= 38:
+        key = f"BEAR_{sym}"
+        if active_signals.get(key) != "BEAR":
+            active_signals[key] = "BEAR"
+            msg = (
+                f"🔻 <b>SELL SIGNAL — {sym}</b>\n\n"
+                f"🕐 {now}  |  💰 CMP: ₹{d['cmp']}\n"
+                f"📊 PCR: {d['pcr']}  |  Score: {d['score']}/100\n"
+                f"🎯 MaxPain: ₹{d['maxPain']}  ({d['mpGap']:+.1f}%)\n"
+                f"🛡️ R1: ₹{d['r1']}  |  🎯 S1: ₹{d['s1']}\n"
+                f"🧱 CeWall: {d['ceSBCount']} strikes\n\n"
+                f"✅ <b>CE Short Build + PE Short Cover fired</b>\n"
+                f"<i>Institutional ceiling confirmed</i>"
+            )
+            send(msg)
+            print(f"[ALERT] SELL — {sym} @ {d['cmp']}")
+    else:
+        active_signals.pop(f"BEAR_{sym}", None)
+
+    # ── COIL BULL: PE-SB×2+ + CE-SB + CMP below MaxPain + PCR >= 1.0 ───────
+    if d["peSBCount"] >= 2 and d["hasCESB"] and d["mpGap"] < -0.5 and d["pcr"] >= 1.0:
+        key = f"COIL_{sym}"
+        if active_signals.get(key) != "COIL":
+            active_signals[key] = "COIL"
+            msg = (
+                f"🔥 <b>COILED SPRING — {sym}</b>\n\n"
+                f"🕐 {now}  |  💰 CMP: ₹{d['cmp']}\n"
+                f"📊 PCR: {d['pcr']}  |  MaxPain: ₹{d['maxPain']}\n"
+                f"📏 MP Gap: {d['mpGap']:+.1f}%  (below = bullish pull)\n"
+                f"🧱 PeWall: {d['peWall']} strikes\n\n"
+                f"⏳ <b>Pre-Breakout Setup</b>\n"
+                f"<i>Wait for CE Short Cover to fire → BUY</i>"
+            )
+            send(msg)
+            print(f"[ALERT] COIL — {sym} @ {d['cmp']}")
+    else:
+        active_signals.pop(f"COIL_{sym}", None)
+
+# ── Market hours check ────────────────────────────────────────────────────────
+def is_market_open():
+    now = datetime.now()
+    h, m = now.hour, now.minute
+    # IST 9:15 AM to 3:35 PM, Mon-Fri
+    if now.weekday() >= 5: return False  # weekend
+    if h < 9 or (h == 9 and m < 15): return False
+    if h > 15 or (h == 15 and m > 35): return False
+    return True
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+def run():
+    print("=" * 55)
+    print("  NSE Signal Alert Bot  v1.0")
+    print("=" * 55)
+    print(f"  Symbols: {len(FO_STOCKS)}")
+    print(f"  Interval: {SCAN_INTERVAL}s")
+    print(f"  Telegram: {'✅ configured' if TELEGRAM_TOKEN != 'YOUR_BOT_TOKEN' else '❌ not set'}")
+    print("=" * 55)
+
+    # Send startup message
+    send(
+        "🟢 <b>NSE Alert Bot Started</b>\n\n"
+        f"Monitoring {len(FO_STOCKS)} F&O stocks\n"
+        "Checking every 3 minutes\n\n"
+        "Will alert on:\n"
+        "⚡ BUY — CE-SC + PE-SB fired\n"
+        "🔻 SELL — CE-SB + PE-SC fired\n"
+        "🔥 COIL — Pre-breakout setup\n\n"
+        "<i>No PC login needed — running in cloud</i>"
+    )
+
+    cycle = 0
+    while True:
+        cycle += 1
+        try:
+            if is_market_open():
+                print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Cycle {cycle} — scanning {len(FO_STOCKS)} symbols...")
+                
+                # Refresh NSE session every 10 cycles
+                if cycle % 10 == 1:
+                    refresh_nse_session()
+
+                errors = 0
+                # Scan in batches of 10 with small delay between batches
+                BATCH = 10
+                for i in range(0, len(FO_STOCKS), BATCH):
+                    batch = FO_STOCKS[i:i+BATCH]
+                    for sym in batch:
+                        try:
+                            data = fetch_option_chain(sym)
+                            if data:
+                                result = analyse(sym, data)
+                                if result:
+                                    check_and_alert(result)
+                            time.sleep(0.3)
+                        except Exception as e:
+                            errors += 1
+                    time.sleep(1)  # pause between batches
+
+                print(f"  Done. {len(FO_STOCKS)} symbols. Errors: {errors}. Next in {SCAN_INTERVAL}s")
+            else:
+                if cycle % 20 == 0:
+                    print(f"[{datetime.now().strftime('%H:%M')}] Market closed. Waiting...")
+
+        except Exception as e:
+            print(f"[ERROR] {e}")
+
+        time.sleep(SCAN_INTERVAL)
+
+if __name__ == "__main__":
+    run()
