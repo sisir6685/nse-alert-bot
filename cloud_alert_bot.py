@@ -1,5 +1,5 @@
 """
-NSE Signal Alert Bot  v2.0  (GitHub Actions edition)
+NSE Signal Alert Bot  v2.1  (GitHub Actions edition)
 =====================================================
 Runs as a single scan per invocation, triggered on a schedule by
 GitHub Actions (.github/workflows/scan.yml) — no server, no PC needed,
@@ -14,6 +14,13 @@ Each run:
   4. Sends Telegram alerts for newly-fired signals.
   5. Saves updated state back to state.json (the workflow commits
      this file back to the repo).
+
+OI classification (v2.1): Short Cover / Short Build / Long Unwind / Long
+Build are distinguished using BOTH open-interest direction AND the option's
+premium price direction (the standard 2x2 matrix), not OI direction alone.
+This matches how platforms like Sensibull/Opstra label OI changes, and
+fixes a v2.0 bug where any OI decrease was assumed to be Short Cover even
+when it was actually Long Unwind (and vice versa for Short Build/Long Build).
 
 Signals:
   BUY       alert: CE Short Cover + PE Short Build both firing, plus PCR/score filter
@@ -170,17 +177,24 @@ def analyse(sym, data):
             pe  = row.get("PE") or {}
             coi = ce.get("openInterest", 0) or 0
             cch = ce.get("changeinOpenInterest", 0) or 0
+            cpx = ce.get("change", 0) or 0            # CE premium change vs prev close
             poi = pe.get("openInterest", 0) or 0
             pch = pe.get("changeinOpenInterest", 0) or 0
+            ppx = pe.get("change", 0) or 0            # PE premium change vs prev close
 
-            # CE tags
-            if coi > 0 and cch < 0: ce_sc.append(sp)   # CE Short Cover
-            if coi > 0 and cch > 0: ce_sb.append(sp)   # CE Short Build
+            # CE tags — classification requires BOTH the OI direction AND the
+            # premium price direction (the standard 2x2 OI-interpretation
+            # matrix). OI falling alone is ambiguous: it's Short Cover only
+            # if premium rose too; if premium fell instead, that's Long
+            # Unwind, which is a different (non-bullish) signal and must
+            # NOT be counted as Short Cover. Same logic mirrored for PE.
+            if coi > 0 and cch < 0 and cpx > 0: ce_sc.append(sp)   # CE Short Cover (OI down, price up)
+            if coi > 0 and cch > 0 and cpx < 0: ce_sb.append(sp)   # CE Short Build (OI up, price down)
             # PE tags
-            if poi > 0 and pch > 0:
-                pe_sb.append(sp)                         # PE Short Build
+            if poi > 0 and pch > 0 and ppx < 0:
+                pe_sb.append(sp)                         # PE Short Build (OI up, price down)
                 pe_wall += 1
-            if poi > 0 and pch < 0: pe_sc.append(sp)   # PE Short Cover
+            if poi > 0 and pch < 0 and ppx > 0: pe_sc.append(sp)   # PE Short Cover (OI down, price up)
 
         # Score (simplified)
         bull = 0; bear = 0
@@ -354,7 +368,7 @@ def is_market_open():
 # ── Single scan (one run of this script = one scan) ──────────────────────────
 def run():
     print("=" * 55)
-    print("  NSE Signal Alert Bot  v2.0 (GitHub Actions)")
+    print("  NSE Signal Alert Bot  v2.1 (GitHub Actions)")
     print("=" * 55)
     print(f"  Symbols: {len(FO_STOCKS)}")
     print(f"  Telegram: {'configured' if TELEGRAM_TOKEN != 'YOUR_BOT_TOKEN' else 'NOT SET'}")
