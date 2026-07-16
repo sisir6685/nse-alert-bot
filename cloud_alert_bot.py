@@ -282,3 +282,54 @@ def check_and_alert(d, active_signals):
         active_signals.pop(f"COIL_{sym}", None)
 
 # ── Market hours check ────────────────────────────────────────
+def is_market_open():
+    now = now_ist()
+    h, m = now.hour, now.minute
+    # IST 9:15 AM to 3:35 PM, Mon-Fri
+    if now.weekday() >= 5: return False  # weekend
+    if h < 9 or (h == 9 and m < 15): return False
+    if h > 15 or (h == 15 and m > 35): return False
+    return True
+
+# ── Single scan (one run of this script = one scan) ──────────────────────────
+def run():
+    print("=" * 55)
+    print("  NSE Signal Alert Bot  v2.0 (GitHub Actions)")
+    print("=" * 55)
+    print(f"  Symbols: {len(FO_STOCKS)}")
+    print(f"  Telegram: {'configured' if TELEGRAM_TOKEN != 'YOUR_BOT_TOKEN' else 'NOT SET'}")
+    print("=" * 55)
+
+    if not is_market_open():
+        print(f"[{now_ist().strftime('%H:%M')}] Market closed. Skipping scan.")
+        return
+
+    active_signals = load_state()
+
+    refresh_nse_session()
+
+    errors = 0
+    print(f"[{now_ist().strftime('%H:%M:%S')}] Scanning {len(FO_STOCKS)} symbols...")
+
+    # Scan in batches of 10 with small delay between batches
+    BATCH = 10
+    for i in range(0, len(FO_STOCKS), BATCH):
+        batch = FO_STOCKS[i:i+BATCH]
+        for sym in batch:
+            try:
+                data = fetch_option_chain(sym)
+                if data:
+                    result = analyse(sym, data)
+                    if result:
+                        check_and_alert(result, active_signals)
+                time.sleep(0.3)
+            except Exception:
+                errors += 1
+        time.sleep(1)  # pause between batches
+
+    print(f"  Done. {len(FO_STOCKS)} symbols. Errors: {errors}.")
+
+    save_state(active_signals)
+
+if __name__ == "__main__":
+    run()
