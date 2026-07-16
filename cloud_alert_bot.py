@@ -1,12 +1,21 @@
 """
-NSE Signal Alert Bot  v1.0
-============================
-Standalone cloud bot — no dashboard, no PC needed.
-Runs on Render.com free tier 24/7.
+NSE Signal Alert Bot  v2.0  (GitHub Actions edition)
+=====================================================
+Runs as a single scan per invocation, triggered on a schedule by
+GitHub Actions (.github/workflows/scan.yml) — no server, no PC needed,
+$0/month.
 
-Fetches NSE option chain directly → checks signals → sends Telegram alert.
+Each run:
+  1. Loads prior signal state from state.json (so we don't re-alert
+     on a signal that's still active from the last run).
+  2. Refreshes an NSE session (fresh cookies every run since this is
+     a brand-new process each time).
+  3. Scans all F&O stocks once.
+  4. Sends Telegram alerts for newly-fired signals.
+  5. Saves updated state back to state.json (the workflow commits
+     this file back to the repo).
 
-Monitors ALL F&O stocks every 3 minutes:
+Signals:
   BUY  alert: CE Short Cover + PE Short Build both firing
   SELL alert: CE Short Build + PE Short Cover both firing
   Coil alert: Coiled Spring pre-breakout/breakdown detected
@@ -15,10 +24,11 @@ Monitors ALL F&O stocks every 3 minutes:
 import os, time, json, requests
 from datetime import datetime
 
-# ── CONFIG (set as environment variables on Render) ───────────────────────────
+# ── CONFIG (set as GitHub Actions secrets) ─────────────────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN")
 TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
-SCAN_INTERVAL  = int(os.environ.get("SCAN_INTERVAL", "300"))  # 5 minutes
+
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 
 # ── F&O Symbols to monitor ────────────────────────────────────────────────────
 FO_STOCKS = [
@@ -54,10 +64,23 @@ NSE_HEADERS = {
     "Connection": "keep-alive",
 }
 
-# ── State tracking ────────────────────────────────────────────────────────────
-active_signals = {}   # sym → signal type currently active
 session = requests.Session()
 session.headers.update(NSE_HEADERS)
+
+# ── State persistence (survives across GitHub Actions runs) ──────────────────
+def load_state():
+    try:
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_state(state):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        print(f"[STATE] Save error: {e}")
 
 # ── NSE cookie refresh ────────────────────────────────────────────────────────
 def refresh_nse_session():
@@ -74,7 +97,7 @@ def fetch_option_chain(sym):
             url = f"https://www.nseindia.com/api/option-chain-indices?symbol={sym}"
         else:
             url = f"https://www.nseindia.com/api/option-chain-equities?symbol={sym}"
-        
+
         r = session.get(url, timeout=10)
         if r.status_code == 200:
             return r.json()
@@ -170,7 +193,7 @@ def analyse(sym, data):
             "hasCESB": bool(ce_sb), "hasPESC": bool(pe_sc),
             "ceSBCount": len(ce_sb), "peSBCount": len(pe_sb),
         }
-    except Exception as e:
+    except Exception:
         return None
 
 # ── Telegram send ─────────────────────────────────────────────────────────────
@@ -187,7 +210,7 @@ def send(msg):
         return False
 
 # ── Check and alert ───────────────────────────────────────────────────────────
-def check_and_alert(d):
+def check_and_alert(d, active_signals):
     sym = d["sym"]
     now = datetime.now().strftime("%H:%M")
 
@@ -260,65 +283,45 @@ def is_market_open():
     if h > 15 or (h == 15 and m > 35): return False
     return True
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
+# ── Single scan (one run of this script = one scan) ──────────────────────────
 def run():
     print("=" * 55)
-    print("  NSE Signal Alert Bot  v1.0")
+    print("  NSE Signal Alert Bot  v2.0 (GitHub Actions)")
     print("=" * 55)
     print(f"  Symbols: {len(FO_STOCKS)}")
-    print(f"  Interval: {SCAN_INTERVAL}s")
-    print(f"  Telegram: {'✅ configured' if TELEGRAM_TOKEN != 'YOUR_BOT_TOKEN' else '❌ not set'}")
+    print(f"  Telegram: {'configured' if TELEGRAM_TOKEN != 'YOUR_BOT_TOKEN' else 'NOT SET'}")
     print("=" * 55)
 
-    # Send startup message
-    send(
-        "🟢 <b>NSE Alert Bot Started</b>\n\n"
-        f"Monitoring {len(FO_STOCKS)} F&O stocks\n"
-        "Checking every 3 minutes\n\n"
-        "Will alert on:\n"
-        "⚡ BUY — CE-SC + PE-SB fired\n"
-        "🔻 SELL — CE-SB + PE-SC fired\n"
-        "🔥 COIL — Pre-breakout setup\n\n"
-        "<i>No PC login needed — running in cloud</i>"
-    )
+    if not is_market_open():
+        print(f"[{datetime.now().strftime('%H:%M')}] Market closed. Skipping scan.")
+        return
 
-    cycle = 0
-    while True:
-        cycle += 1
-        try:
-            if is_market_open():
-                print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Cycle {cycle} — scanning {len(FO_STOCKS)} symbols...")
-                
-                # Refresh NSE session every 10 cycles
-                if cycle % 10 == 1:
-                    refresh_nse_session()
+    active_signals = load_state()
 
-                errors = 0
-                # Scan in batches of 10 with small delay between batches
-                BATCH = 10
-                for i in range(0, len(FO_STOCKS), BATCH):
-                    batch = FO_STOCKS[i:i+BATCH]
-                    for sym in batch:
-                        try:
-                            data = fetch_option_chain(sym)
-                            if data:
-                                result = analyse(sym, data)
-                                if result:
-                                    check_and_alert(result)
-                            time.sleep(0.3)
-                        except Exception as e:
-                            errors += 1
-                    time.sleep(1)  # pause between batches
+    refresh_nse_session()
 
-                print(f"  Done. {len(FO_STOCKS)} symbols. Errors: {errors}. Next in {SCAN_INTERVAL}s")
-            else:
-                if cycle % 20 == 0:
-                    print(f"[{datetime.now().strftime('%H:%M')}] Market closed. Waiting...")
+    errors = 0
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Scanning {len(FO_STOCKS)} symbols...")
 
-        except Exception as e:
-            print(f"[ERROR] {e}")
+    # Scan in batches of 10 with small delay between batches
+    BATCH = 10
+    for i in range(0, len(FO_STOCKS), BATCH):
+        batch = FO_STOCKS[i:i+BATCH]
+        for sym in batch:
+            try:
+                data = fetch_option_chain(sym)
+                if data:
+                    result = analyse(sym, data)
+                    if result:
+                        check_and_alert(result, active_signals)
+                time.sleep(0.3)
+            except Exception:
+                errors += 1
+        time.sleep(1)  # pause between batches
 
-        time.sleep(SCAN_INTERVAL)
+    print(f"  Done. {len(FO_STOCKS)} symbols. Errors: {errors}.")
+
+    save_state(active_signals)
 
 if __name__ == "__main__":
     run()
