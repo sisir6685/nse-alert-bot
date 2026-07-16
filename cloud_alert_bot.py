@@ -23,6 +23,14 @@ Signals:
 
 import os, time, json, requests
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
+# GitHub Actions runners run in UTC — all market-hours logic must be
+# anchored to IST explicitly, never to naive datetime.now().
+IST = ZoneInfo("Asia/Kolkata")
+
+def now_ist():
+    return datetime.now(IST)
 
 # ── CONFIG (set as GitHub Actions secrets) ─────────────────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN")
@@ -212,7 +220,7 @@ def send(msg):
 # ── Check and alert ───────────────────────────────────────────────────────────
 def check_and_alert(d, active_signals):
     sym = d["sym"]
-    now = datetime.now().strftime("%H:%M")
+    now = now_ist().strftime("%H:%M")
 
     # ── BUY: CE-SC + PE-SB + PCR >= 1.0 + Score >= 62 ──────────────────────
     if d["hasCESC"] and d["hasPESB"] and d["pcr"] >= 1.0 and d["score"] >= 62:
@@ -273,55 +281,4 @@ def check_and_alert(d, active_signals):
     else:
         active_signals.pop(f"COIL_{sym}", None)
 
-# ── Market hours check ────────────────────────────────────────────────────────
-def is_market_open():
-    now = datetime.now()
-    h, m = now.hour, now.minute
-    # IST 9:15 AM to 3:35 PM, Mon-Fri
-    if now.weekday() >= 5: return False  # weekend
-    if h < 9 or (h == 9 and m < 15): return False
-    if h > 15 or (h == 15 and m > 35): return False
-    return True
-
-# ── Single scan (one run of this script = one scan) ──────────────────────────
-def run():
-    print("=" * 55)
-    print("  NSE Signal Alert Bot  v2.0 (GitHub Actions)")
-    print("=" * 55)
-    print(f"  Symbols: {len(FO_STOCKS)}")
-    print(f"  Telegram: {'configured' if TELEGRAM_TOKEN != 'YOUR_BOT_TOKEN' else 'NOT SET'}")
-    print("=" * 55)
-
-    if not is_market_open():
-        print(f"[{datetime.now().strftime('%H:%M')}] Market closed. Skipping scan.")
-        return
-
-    active_signals = load_state()
-
-    refresh_nse_session()
-
-    errors = 0
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Scanning {len(FO_STOCKS)} symbols...")
-
-    # Scan in batches of 10 with small delay between batches
-    BATCH = 10
-    for i in range(0, len(FO_STOCKS), BATCH):
-        batch = FO_STOCKS[i:i+BATCH]
-        for sym in batch:
-            try:
-                data = fetch_option_chain(sym)
-                if data:
-                    result = analyse(sym, data)
-                    if result:
-                        check_and_alert(result, active_signals)
-                time.sleep(0.3)
-            except Exception:
-                errors += 1
-        time.sleep(1)  # pause between batches
-
-    print(f"  Done. {len(FO_STOCKS)} symbols. Errors: {errors}.")
-
-    save_state(active_signals)
-
-if __name__ == "__main__":
-    run()
+# ── Market hours check ────────────────────────────────────────
