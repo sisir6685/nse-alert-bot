@@ -16,12 +16,17 @@ Each run:
      this file back to the repo).
 
 Signals:
-  BUY  alert: CE Short Cover + PE Short Build both firing
-  SELL alert: CE Short Build + PE Short Cover both firing
-  Coil alert: Coiled Spring pre-breakout/breakdown detected
+  BUY       alert: CE Short Cover + PE Short Build both firing, plus PCR/score filter
+  SELL      alert: CE Short Build + PE Short Cover both firing, plus PCR/score filter
+  BUY-CORE  alert: CE Short Cover + PE Short Build both firing — no other filter
+  SELL-CORE alert: CE Short Build + PE Short Cover both firing — no other filter
+  Coil      alert: Coiled Spring pre-breakout/breakdown detected
+
+Every fired signal is also appended to signal_log.csv (committed back to the
+repo alongside state.json) so you can tally how often each type fires.
 """
 
-import os, time, json, requests
+import os, csv, time, json, requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -37,6 +42,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN")
 TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+LOG_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "signal_log.csv")
 
 # ── F&O Symbols to monitor ────────────────────────────────────────────────────
 FO_STOCKS = [
@@ -89,6 +95,21 @@ def save_state(state):
             json.dump(state, f)
     except Exception as e:
         print(f"[STATE] Save error: {e}")
+
+# ── Signal frequency log (CSV, appended every fired alert) ───────────────────
+def log_signal(signal_type, d):
+    try:
+        is_new = not os.path.exists(LOG_FILE)
+        with open(LOG_FILE, "a", newline="") as f:
+            writer = csv.writer(f)
+            if is_new:
+                writer.writerow(["timestamp_ist", "signal", "symbol", "cmp", "pcr", "score", "maxPain", "mpGap"])
+            writer.writerow([
+                now_ist().strftime("%Y-%m-%d %H:%M:%S"),
+                signal_type, d["sym"], d["cmp"], d["pcr"], d["score"], d["maxPain"], d["mpGap"],
+            ])
+    except Exception as e:
+        print(f"[LOG] Error: {e}")
 
 # ── NSE cookie refresh ────────────────────────────────────────────────────────
 def refresh_nse_session():
@@ -239,8 +260,27 @@ def check_and_alert(d, active_signals):
             )
             send(msg)
             print(f"[ALERT] BUY — {sym} @ {d['cmp']}")
+            log_signal("BUY", d)
     else:
         active_signals.pop(f"BULL_{sym}", None)
+
+    # ── BUY-CORE: CE-SC + PE-SB only — no PCR/score filter ──────────────────
+    if d["hasCESC"] and d["hasPESB"]:
+        key = f"BUYCORE_{sym}"
+        if active_signals.get(key) != "BUYCORE":
+            active_signals[key] = "BUYCORE"
+            msg = (
+                f"🟢 <b>BUY-CORE — {sym}</b>\n\n"
+                f"🕐 {now}  |  💰 CMP: ₹{d['cmp']}\n"
+                f"📊 PCR: {d['pcr']}  |  Score: {d['score']}/100\n\n"
+                f"✅ <b>CE Short Cover + PE Short Build fired</b>\n"
+                f"<i>Raw OI pattern only — no PCR/score filter</i>"
+            )
+            send(msg)
+            print(f"[ALERT] BUY-CORE — {sym} @ {d['cmp']}")
+            log_signal("BUY-CORE", d)
+    else:
+        active_signals.pop(f"BUYCORE_{sym}", None)
 
     # ── SELL: CE-SB + PE-SC + PCR <= 0.85 + Score <= 38 ────────────────────
     if d["hasCESB"] and d["hasPESC"] and d["pcr"] <= 0.85 and d["score"] <= 38:
@@ -259,8 +299,27 @@ def check_and_alert(d, active_signals):
             )
             send(msg)
             print(f"[ALERT] SELL — {sym} @ {d['cmp']}")
+            log_signal("SELL", d)
     else:
         active_signals.pop(f"BEAR_{sym}", None)
+
+    # ── SELL-CORE: CE-SB + PE-SC only — no PCR/score filter ─────────────────
+    if d["hasCESB"] and d["hasPESC"]:
+        key = f"SELLCORE_{sym}"
+        if active_signals.get(key) != "SELLCORE":
+            active_signals[key] = "SELLCORE"
+            msg = (
+                f"🔴 <b>SELL-CORE — {sym}</b>\n\n"
+                f"🕐 {now}  |  💰 CMP: ₹{d['cmp']}\n"
+                f"📊 PCR: {d['pcr']}  |  Score: {d['score']}/100\n\n"
+                f"✅ <b>CE Short Build + PE Short Cover fired</b>\n"
+                f"<i>Raw OI pattern only — no PCR/score filter</i>"
+            )
+            send(msg)
+            print(f"[ALERT] SELL-CORE — {sym} @ {d['cmp']}")
+            log_signal("SELL-CORE", d)
+    else:
+        active_signals.pop(f"SELLCORE_{sym}", None)
 
     # ── COIL BULL: PE-SB×2+ + CE-SB + CMP below MaxPain + PCR >= 1.0 ───────
     if d["peSBCount"] >= 2 and d["hasCESB"] and d["mpGap"] < -0.5 and d["pcr"] >= 1.0:
@@ -278,10 +337,11 @@ def check_and_alert(d, active_signals):
             )
             send(msg)
             print(f"[ALERT] COIL — {sym} @ {d['cmp']}")
+            log_signal("COIL", d)
     else:
         active_signals.pop(f"COIL_{sym}", None)
 
-# ── Market hours check ────────────────────────────────────────
+# ── Market hours check ────────────────────────────────────────────────────────
 def is_market_open():
     now = now_ist()
     h, m = now.hour, now.minute
