@@ -31,6 +31,10 @@ Signals:
 
 Every fired signal is also appended to signal_log.csv (committed back to the
 repo alongside state.json) so you can tally how often each type fires.
+
+v2.1-diag: added diagnostic counters + a one-time raw sample dump per run so
+we can tell whether NSE is actually returning data (vs blocking) and whether
+the 'change' field (needed for the price-direction check) is really present.
 """
 
 import os, csv, time, json, requests
@@ -355,6 +359,28 @@ def check_and_alert(d, active_signals):
     else:
         active_signals.pop(f"COIL_{sym}", None)
 
+# ── One-time diagnostic dump (first symbol with real rows each run) ──────────
+def dump_sample(sym, data):
+    try:
+        rec = data.get("records", {})
+        rows = rec.get("data", [])
+        if not rows:
+            print(f"[DIAG] Sample symbol={sym}: no rows in records.data")
+            return
+        ce = rows[0].get("CE") or {}
+        pe = rows[0].get("PE") or {}
+        print(f"[DIAG] Sample symbol={sym}  strike={rows[0].get('strikePrice')}")
+        print(f"[DIAG] CE keys present: {sorted(ce.keys())}")
+        print(f"[DIAG] CE values: openInterest={ce.get('openInterest')!r} "
+              f"changeinOpenInterest={ce.get('changeinOpenInterest')!r} "
+              f"change={ce.get('change')!r} lastPrice={ce.get('lastPrice')!r}")
+        print(f"[DIAG] PE keys present: {sorted(pe.keys())}")
+        print(f"[DIAG] PE values: openInterest={pe.get('openInterest')!r} "
+              f"changeinOpenInterest={pe.get('changeinOpenInterest')!r} "
+              f"change={pe.get('change')!r} lastPrice={pe.get('lastPrice')!r}")
+    except Exception as e:
+        print(f"[DIAG] Sample dump error for {sym}: {e}")
+
 # ── Market hours check ────────────────────────────────────────────────────────
 def is_market_open():
     now = now_ist()
@@ -383,6 +409,12 @@ def run():
     refresh_nse_session()
 
     errors = 0
+    diag = {
+        "fetched_ok": 0, "fetched_empty": 0,
+        "analysed_ok": 0, "analysed_none": 0,
+        "any_ce_sc": 0, "any_pe_sb": 0, "any_ce_sb": 0, "any_pe_sc": 0,
+    }
+    sample_dumped = False
     print(f"[{now_ist().strftime('%H:%M:%S')}] Scanning {len(FO_STOCKS)} symbols...")
 
     # Scan in batches of 10 with small delay between batches
@@ -393,15 +425,34 @@ def run():
             try:
                 data = fetch_option_chain(sym)
                 if data:
+                    diag["fetched_ok"] += 1
+                    if not sample_dumped:
+                        dump_sample(sym, data)
+                        sample_dumped = True
                     result = analyse(sym, data)
                     if result:
+                        diag["analysed_ok"] += 1
+                        if result["hasCESC"]: diag["any_ce_sc"] += 1
+                        if result["hasPESB"]: diag["any_pe_sb"] += 1
+                        if result["hasCESB"]: diag["any_ce_sb"] += 1
+                        if result["hasPESC"]: diag["any_pe_sc"] += 1
                         check_and_alert(result, active_signals)
+                    else:
+                        diag["analysed_none"] += 1
+                else:
+                    diag["fetched_empty"] += 1
                 time.sleep(0.3)
             except Exception:
                 errors += 1
         time.sleep(1)  # pause between batches
 
     print(f"  Done. {len(FO_STOCKS)} symbols. Errors: {errors}.")
+    print(f"[DIAG] Fetch OK: {diag['fetched_ok']}  Fetch empty/blocked: {diag['fetched_empty']}")
+    print(f"[DIAG] Analysed OK: {diag['analysed_ok']}  Analysed None (no spot/rows): {diag['analysed_none']}")
+    print(f"[DIAG] Symbols with any CE-Short-Cover: {diag['any_ce_sc']}  "
+          f"any PE-Short-Build: {diag['any_pe_sb']}  "
+          f"any CE-Short-Build: {diag['any_ce_sb']}  "
+          f"any PE-Short-Cover: {diag['any_pe_sc']}")
 
     save_state(active_signals)
 
