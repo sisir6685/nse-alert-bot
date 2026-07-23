@@ -31,10 +31,6 @@ Signals:
 
 Every fired signal is also appended to signal_log.csv (committed back to the
 repo alongside state.json) so you can tally how often each type fires.
-
-v2.1-diag: added diagnostic counters + a one-time raw sample dump per run so
-we can tell whether NSE is actually returning data (vs blocking) and whether
-the 'change' field (needed for the price-direction check) is really present.
 """
 
 import os, csv, time, json, requests
@@ -125,13 +121,19 @@ def log_signal(signal_type, d):
 # ── NSE cookie refresh ────────────────────────────────────────────────────────
 def refresh_nse_session():
     try:
-        session.get("https://www.nseindia.com", timeout=10)
-        session.get("https://www.nseindia.com/market-data/live-equity-market", timeout=10)
+        r1 = session.get("https://www.nseindia.com", timeout=10)
+        r2 = session.get("https://www.nseindia.com/market-data/live-equity-market", timeout=10)
+        print(f"[DIAG] Session warm-up: homepage status={r1.status_code} len={len(r1.content)}  "
+              f"live-page status={r2.status_code} len={len(r2.content)}")
+        print(f"[DIAG] Cookies set after warm-up: {list(session.cookies.keys())}")
     except Exception as e:
         print(f"[NSE] Session refresh error: {e}")
 
 # ── Fetch option chain for one symbol ────────────────────────────────────────
+_diag_fetch_dumped = False
+
 def fetch_option_chain(sym):
+    global _diag_fetch_dumped
     try:
         if sym in ["NIFTY","BANKNIFTY","FINNIFTY","MIDCPNIFTY","NIFTYNXT50"]:
             url = f"https://www.nseindia.com/api/option-chain-indices?symbol={sym}"
@@ -141,8 +143,16 @@ def fetch_option_chain(sym):
         r = session.get(url, timeout=10)
         if r.status_code == 200:
             return r.json()
+        if not _diag_fetch_dumped:
+            _diag_fetch_dumped = True
+            print(f"[DIAG] Fetch failed for {sym}: status={r.status_code}  "
+                  f"content-type={r.headers.get('Content-Type')}  "
+                  f"body_snippet={r.text[:300]!r}")
         return None
-    except Exception:
+    except Exception as e:
+        if not _diag_fetch_dumped:
+            _diag_fetch_dumped = True
+            print(f"[DIAG] Fetch exception for {sym}: {type(e).__name__}: {e}")
         return None
 
 # ── Analyse option chain ──────────────────────────────────────────────────────
