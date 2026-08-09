@@ -1,8 +1,16 @@
 """
-NSE Signal Alert Bot  v3.1  (Fyers API edition — BUY/SELL only)
+NSE Signal Alert Bot  v3.2  (Fyers API edition — BUY/SELL only)
 =================================================
 Runs as a single scan per invocation, triggered on a schedule by
 GitHub Actions (.github/workflows/scan.yml) — no server, no PC needed.
+
+v3.2 change log (from v3.1) — thresholds recalibrated against a 12-day
+historical backtest of signal_log.csv to target ~5 signals/day per side:
+  - BUY: score bar raised to >= 80 (was 70) — this requires a "pure"
+    signal (no conflicting bearish flags), not just a loose score pass.
+    PCR bar unchanged at >= 1.15.
+  - SELL: PCR bar tightened to <= 0.45 (was 0.70), score bar tightened
+    to <= 15 (was 25, also now a "pure" signal requirement).
 
 v3.1 change log (from v3.0):
   - Removed BUY-CORE / SELL-CORE (unfiltered "no PCR/score filter" alerts)
@@ -35,9 +43,9 @@ how platforms like Sensibull/Opstra label OI changes.
 
 Signals:
   BUY   alert: CE Short Cover (>=2 strikes) + PE Short Build (>=2 strikes)
-               + PCR >= 1.15 + Score >= 70
+               + PCR >= 1.15 + Score >= 80 (pure signal, no conflicting flags)
   SELL  alert: CE Short Build (>=2 strikes) + PE Short Cover (>=2 strikes)
-               + PCR <= 0.70 + Score <= 25
+               + PCR <= 0.45 + Score <= 15 (pure signal, no conflicting flags)
 
 Every fired signal is also appended to signal_log.csv (committed back to the
 repo alongside state.json) so you can tally how often each type fires.
@@ -365,8 +373,8 @@ def check_and_alert(d, active_signals):
     sym = d["sym"]
     now = now_ist().strftime("%H:%M")
 
-    # ── BUY: CE-SC + PE-SB (>=2 strikes each) + PCR >= 1.15 + Score >= 70 ──
-    if d["hasCESC"] and d["hasPESB"] and d["pcr"] >= 1.15 and d["score"] >= 70:
+    # ── BUY: CE-SC + PE-SB (>=2 strikes each) + PCR >= 1.15 + Score >= 80 (pure) ──
+    if d["hasCESC"] and d["hasPESB"] and d["pcr"] >= 1.15 and d["score"] >= 80:
         key = f"BULL_{sym}"
         if active_signals.get(key) != "BULL":
             active_signals[key] = "BULL"
@@ -386,8 +394,8 @@ def check_and_alert(d, active_signals):
     else:
         active_signals.pop(f"BULL_{sym}", None)
 
-    # ── SELL: CE-SB + PE-SC (>=2 strikes each) + PCR <= 0.70 + Score <= 25 ─
-    if d["hasCESB"] and d["hasPESC"] and d["pcr"] <= 0.70 and d["score"] <= 25:
+    # ── SELL: CE-SB + PE-SC (>=2 strikes each) + PCR <= 0.45 + Score <= 15 (pure) ─
+    if d["hasCESB"] and d["hasPESC"] and d["pcr"] <= 0.45 and d["score"] <= 15:
         key = f"BEAR_{sym}"
         if active_signals.get(key) != "BEAR":
             active_signals[key] = "BEAR"
@@ -420,7 +428,7 @@ def is_market_open():
 # ── Single scan (one run of this script = one scan) ──────────────────────────
 def run():
     print("=" * 55)
-    print("  NSE Signal Alert Bot  v3.1 (Fyers API edition — BUY/SELL only)")
+    print("  NSE Signal Alert Bot  v3.2 (Fyers API edition — BUY/SELL only)")
     print("=" * 55)
     print(f"  Symbols: {len(FO_STOCKS)}")
     print(f"  Telegram: {'configured' if TELEGRAM_TOKEN != 'YOUR_BOT_TOKEN' else 'NOT SET'}")
