@@ -1,10 +1,19 @@
 """
-NSE Signal Alert Bot  v3.0  (Fyers API edition)
+NSE Signal Alert Bot  v3.1  (Fyers API edition — BUY/SELL only)
 =================================================
 Runs as a single scan per invocation, triggered on a schedule by
 GitHub Actions (.github/workflows/scan.yml) — no server, no PC needed.
 
-v3.0 replaces v2.x's NSE-website scraping (which was permanently blocked
+v3.1 change log (from v3.0):
+  - Removed BUY-CORE / SELL-CORE (unfiltered "no PCR/score filter" alerts)
+    and COIL (pre-breakout prep alert) — these were flooding Telegram with
+    non-actionable noise. Only BUY and SELL remain.
+  - hasCESC / hasPESB / hasCESB / hasPESC now require >=2 strikes agreeing
+    (was: any single strike), to filter out single-strike option-chain noise.
+  - BUY threshold tightened: PCR >= 1.15 (was 1.0), score >= 70 (was 62).
+  - SELL threshold tightened: PCR <= 0.70 (was 0.85), score <= 25 (was 38).
+
+v3.0 replaced v2.x's NSE-website scraping (which was permanently blocked
 by NSE's Akamai bot protection — every request from GitHub's IPs was
 rejected) with the official Fyers broker API. Fyers access tokens expire
 every 24h, so each run performs a fully-automated login (TOTP + PIN, no
@@ -15,7 +24,7 @@ Each run:
   2. Loads prior signal state from state.json (so we don't re-alert
      on a signal that's still active from the last run).
   3. Scans all F&O stocks once via Fyers' option-chain API.
-  4. Sends Telegram alerts for newly-fired signals.
+  4. Sends Telegram alerts for newly-fired BUY/SELL signals.
   5. Saves updated state back to state.json (the workflow commits
      this file back to the repo).
 
@@ -25,11 +34,10 @@ open-interest direction (oich) AND the option's premium price direction
 how platforms like Sensibull/Opstra label OI changes.
 
 Signals:
-  BUY       alert: CE Short Cover + PE Short Build both firing, plus PCR/score filter
-  SELL      alert: CE Short Build + PE Short Cover both firing, plus PCR/score filter
-  BUY-CORE  alert: CE Short Cover + PE Short Build both firing — no other filter
-  SELL-CORE alert: CE Short Build + PE Short Cover both firing — no other filter
-  Coil      alert: Coiled Spring pre-breakout/breakdown detected
+  BUY   alert: CE Short Cover (>=2 strikes) + PE Short Build (>=2 strikes)
+               + PCR >= 1.15 + Score >= 70
+  SELL  alert: CE Short Build (>=2 strikes) + PE Short Cover (>=2 strikes)
+               + PCR <= 0.70 + Score <= 25
 
 Every fired signal is also appended to signal_log.csv (committed back to the
 repo alongside state.json) so you can tally how often each type fires.
@@ -330,8 +338,10 @@ def analyse(sym, resp):
             "sym": sym, "cmp": spot, "pcr": pcr, "score": score,
             "maxPain": max_pain, "mpGap": mp_gap,
             "r1": r1, "s1": s1, "peWall": pe_wall,
-            "hasCESC": bool(ce_sc), "hasPESB": bool(pe_sb),
-            "hasCESB": bool(ce_sb), "hasPESC": bool(pe_sc),
+            # v3.1: require >=2 strikes agreeing, not just any single strike,
+            # to filter out single-strike option-chain noise.
+            "hasCESC": len(ce_sc) >= 2, "hasPESB": len(pe_sb) >= 2,
+            "hasCESB": len(ce_sb) >= 2, "hasPESC": len(pe_sc) >= 2,
             "ceSBCount": len(ce_sb), "peSBCount": len(pe_sb),
         }
     except Exception:
@@ -350,13 +360,13 @@ def send(msg):
         print(f"[TG] Error: {e}")
         return False
 
-# ── Check and alert ───────────────────────────────────────────────────────────
+# ── Check and alert (v3.1: BUY / SELL only — CORE and COIL removed) ──────────
 def check_and_alert(d, active_signals):
     sym = d["sym"]
     now = now_ist().strftime("%H:%M")
 
-    # ── BUY: CE-SC + PE-SB + PCR >= 1.0 + Score >= 62 ──────────────────────
-    if d["hasCESC"] and d["hasPESB"] and d["pcr"] >= 1.0 and d["score"] >= 62:
+    # ── BUY: CE-SC + PE-SB (>=2 strikes each) + PCR >= 1.15 + Score >= 70 ──
+    if d["hasCESC"] and d["hasPESB"] and d["pcr"] >= 1.15 and d["score"] >= 70:
         key = f"BULL_{sym}"
         if active_signals.get(key) != "BULL":
             active_signals[key] = "BULL"
@@ -376,26 +386,8 @@ def check_and_alert(d, active_signals):
     else:
         active_signals.pop(f"BULL_{sym}", None)
 
-    # ── BUY-CORE: CE-SC + PE-SB only — no PCR/score filter ──────────────────
-    if d["hasCESC"] and d["hasPESB"]:
-        key = f"BUYCORE_{sym}"
-        if active_signals.get(key) != "BUYCORE":
-            active_signals[key] = "BUYCORE"
-            msg = (
-                f"🟢 <b>BUY-CORE — {sym}</b>\n\n"
-                f"🕐 {now}  |  💰 CMP: ₹{d['cmp']}\n"
-                f"📊 PCR: {d['pcr']}  |  Score: {d['score']}/100\n\n"
-                f"✅ <b>CE Short Cover + PE Short Build fired</b>\n"
-                f"<i>Raw OI pattern only — no PCR/score filter</i>"
-            )
-            send(msg)
-            print(f"[ALERT] BUY-CORE — {sym} @ {d['cmp']}")
-            log_signal("BUY-CORE", d)
-    else:
-        active_signals.pop(f"BUYCORE_{sym}", None)
-
-    # ── SELL: CE-SB + PE-SC + PCR <= 0.85 + Score <= 38 ────────────────────
-    if d["hasCESB"] and d["hasPESC"] and d["pcr"] <= 0.85 and d["score"] <= 38:
+    # ── SELL: CE-SB + PE-SC (>=2 strikes each) + PCR <= 0.70 + Score <= 25 ─
+    if d["hasCESB"] and d["hasPESC"] and d["pcr"] <= 0.70 and d["score"] <= 25:
         key = f"BEAR_{sym}"
         if active_signals.get(key) != "BEAR":
             active_signals[key] = "BEAR"
@@ -415,44 +407,6 @@ def check_and_alert(d, active_signals):
     else:
         active_signals.pop(f"BEAR_{sym}", None)
 
-    # ── SELL-CORE: CE-SB + PE-SC only — no PCR/score filter ─────────────────
-    if d["hasCESB"] and d["hasPESC"]:
-        key = f"SELLCORE_{sym}"
-        if active_signals.get(key) != "SELLCORE":
-            active_signals[key] = "SELLCORE"
-            msg = (
-                f"🔴 <b>SELL-CORE — {sym}</b>\n\n"
-                f"🕐 {now}  |  💰 CMP: ₹{d['cmp']}\n"
-                f"📊 PCR: {d['pcr']}  |  Score: {d['score']}/100\n\n"
-                f"✅ <b>CE Short Build + PE Short Cover fired</b>\n"
-                f"<i>Raw OI pattern only — no PCR/score filter</i>"
-            )
-            send(msg)
-            print(f"[ALERT] SELL-CORE — {sym} @ {d['cmp']}")
-            log_signal("SELL-CORE", d)
-    else:
-        active_signals.pop(f"SELLCORE_{sym}", None)
-
-    # ── COIL BULL: PE-SB×2+ + CE-SB + CMP below MaxPain + PCR >= 1.0 ───────
-    if d["peSBCount"] >= 2 and d["hasCESB"] and d["mpGap"] < -0.5 and d["pcr"] >= 1.0:
-        key = f"COIL_{sym}"
-        if active_signals.get(key) != "COIL":
-            active_signals[key] = "COIL"
-            msg = (
-                f"🔥 <b>COILED SPRING — {sym}</b>\n\n"
-                f"🕐 {now}  |  💰 CMP: ₹{d['cmp']}\n"
-                f"📊 PCR: {d['pcr']}  |  MaxPain: ₹{d['maxPain']}\n"
-                f"📏 MP Gap: {d['mpGap']:+.1f}%  (below = bullish pull)\n"
-                f"🧱 PeWall: {d['peWall']} strikes\n\n"
-                f"⏳ <b>Pre-Breakout Setup</b>\n"
-                f"<i>Wait for CE Short Cover to fire → BUY</i>"
-            )
-            send(msg)
-            print(f"[ALERT] COIL — {sym} @ {d['cmp']}")
-            log_signal("COIL", d)
-    else:
-        active_signals.pop(f"COIL_{sym}", None)
-
 # ── Market hours check ────────────────────────────────────────────────────────
 def is_market_open():
     now = now_ist()
@@ -466,7 +420,7 @@ def is_market_open():
 # ── Single scan (one run of this script = one scan) ──────────────────────────
 def run():
     print("=" * 55)
-    print("  NSE Signal Alert Bot  v3.0 (Fyers API edition)")
+    print("  NSE Signal Alert Bot  v3.1 (Fyers API edition — BUY/SELL only)")
     print("=" * 55)
     print(f"  Symbols: {len(FO_STOCKS)}")
     print(f"  Telegram: {'configured' if TELEGRAM_TOKEN != 'YOUR_BOT_TOKEN' else 'NOT SET'}")
