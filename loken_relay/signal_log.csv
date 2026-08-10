@@ -1,2 +1,3 @@
 timestamp_ist,signal,ticker,exchange,price,alert_time
 2026-08-10 09:20:01,Buy B,{{ticker}},{{exchange}},{{close}},{{time}}
+2026-08-10 09:20:03,Buy A,{{ticker}},{{exchange}},{{close}},{{time}}
