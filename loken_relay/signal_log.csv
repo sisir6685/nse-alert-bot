@@ -13,3 +13,4 @@ timestamp_ist,signal,ticker,exchange,price,alert_time
 2026-08-10 09:20:19,Buy B,{{ticker}},{{exchange}},{{close}},{{time}}
 2026-08-10 09:20:20,Sell B+,{{ticker}},{{exchange}},{{close}},{{time}}
 2026-08-10 09:20:22,Buy A,{{ticker}},{{exchange}},{{close}},{{time}}
+2026-08-10 09:20:23,Buy B,{{ticker}},{{exchange}},{{close}},{{time}}
