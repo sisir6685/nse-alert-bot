@@ -63,7 +63,11 @@ TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessag
 IST = timezone(timedelta(hours=5, minutes=30))
 MARKET_OPEN = (9, 15)   # 9:15 AM IST
 MARKET_CLOSE = (15, 30)  # 3:30 PM IST
-CSV_HEADER = "timestamp_ist,signal,ticker,exchange,price,alert_time\n"
+# FIX: dropped the "alert_time" column (the bar-close time embedded in
+# the Pine script's message). It was redundant with timestamp_ist (the
+# relay's own receipt time, first column) and usually only a few seconds
+# apart from it, so it added noise without adding information.
+CSV_HEADER = "timestamp_ist,signal,ticker,exchange,price\n"
 
 
 def _emoji_for_signal(signal_name: str) -> str:
@@ -75,6 +79,10 @@ def _emoji_for_signal(signal_name: str) -> str:
 
 
 def _format_message(payload: dict) -> str:
+    """FIX: trimmed to exactly ticker, signal type, price, and time —
+    dropped the separate exchange line and the "Received: UTC" footer,
+    which were extra clutter beyond what was asked for. Now two compact
+    lines instead of four."""
     signal = payload.get("signal", "Unknown Signal")
     ticker = payload.get("ticker", "?")
     exchange = payload.get("exchange", "")
@@ -84,15 +92,12 @@ def _format_message(payload: dict) -> str:
     emoji = _emoji_for_signal(signal)
     exch_part = f"{exchange}:" if exchange else ""
 
-    lines = [
-        f"{emoji} <b>{signal}</b>",
-        f"<b>{exch_part}{ticker}</b>",
-        f"Price: {price}",
-    ]
+    line1 = f"{emoji} <b>{signal}</b> — {exch_part}{ticker}"
+    line2 = f"₹{price}"
     if time_str:
-        lines.append(f"Time: {time_str}")
-    lines.append(f"Received: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
-    return "\n".join(lines)
+        line2 += f"  |  {time_str}"
+
+    return line1 + "\n" + line2
 
 
 def _send_to_telegram(text: str) -> tuple[bool, str]:
@@ -164,13 +169,14 @@ def _append_to_github_csv(payload: dict) -> tuple[bool, str]:
     else:
         return False, f"GitHub GET failed {get_resp.status_code}: {get_resp.text}"
 
-    row = "{},{},{},{},{},{}\n".format(
+    # FIX: dropped the trailing payload.get("time", "") field — matches
+    # the CSV_HEADER change above (alert_time column removed).
+    row = "{},{},{},{},{}\n".format(
         now_ist.strftime("%Y-%m-%d %H:%M:%S"),
         payload.get("signal", ""),
         payload.get("ticker", ""),
         payload.get("exchange", ""),
         payload.get("price", ""),
-        payload.get("time", ""),
     )
     new_content = current_content + row
 
@@ -198,7 +204,7 @@ def health():
 
 
 def _parse_delimited_message(raw_body: str) -> dict | None:
-    """Parses the new "TICKER - SIGNAL - EXCHANGE - PRICE - TIME[ - SECRET]"
+    """Parses the "TICKER - SIGNAL - EXCHANGE - PRICE - TIME[ - SECRET]"
     format sent by the Pine script's alert() calls. Returns None if the
     text doesn't look like this format at all."""
     parts = [p.strip() for p in raw_body.strip().split(" - ")]
@@ -223,11 +229,10 @@ def webhook():
     raw_body = request.get_data(as_text=True)
     log.info("Incoming webhook, raw body: %s", raw_body)
 
-    # Try the new human-readable pipe-delimited format first (this is
-    # what the Pine script now sends, so it also displays nicely in
-    # TradingView's own Alert Log/toast notifications). Fall back to
-    # JSON for backward compatibility with any older alert setups still
-    # using the previous format.
+    # Try the human-readable pipe-delimited format first (this is what
+    # the Pine script sends, so it also displays nicely in TradingView's
+    # own Alert Log/toast notifications). Fall back to JSON for backward
+    # compatibility with any older alert setups still using that format.
     payload = _parse_delimited_message(raw_body)
     if payload is None:
         try:
