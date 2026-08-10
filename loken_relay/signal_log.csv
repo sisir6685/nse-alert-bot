@@ -50,3 +50,4 @@ timestamp_ist,signal,ticker,exchange,price,alert_time
 2026-08-10 11:25:01,Sell E+,{{ticker}},{{exchange}},{{close}},{{time}}
 2026-08-10 11:35:01,Sell E,{{ticker}},{{exchange}},{{close}},{{time}}
 2026-08-10 11:50:07,Sell E,TORNTPOWER,NSE,1358,2026-08-10 11:45:00 IST
+2026-08-10 11:55:02,Sell E,INFY,NSE,1184.3,2026-08-10 11:50:00 IST
