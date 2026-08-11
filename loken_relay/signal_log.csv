@@ -96,3 +96,4 @@ timestamp_ist,signal,ticker,exchange,price,alert_time
 2026-08-11 09:20:38,Buy (A+, B+, C+),NATIONALUM,NSE,389.35
 2026-08-11 09:25:08,Sell (B+),UPL,NSE,566.85
 2026-08-11 09:30:05,Sell (A+, A),SUNPHARMA,NSE,1939
+2026-08-11 09:30:06,Sell (B+),TORNTPHARM,NSE,4874
