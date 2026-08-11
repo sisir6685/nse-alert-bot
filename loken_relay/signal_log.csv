@@ -110,3 +110,4 @@ timestamp_ist,signal,ticker,exchange,price,alert_time
 2026-08-11 09:45:10,Buy (B+),BAJAJ_AUTO,NSE,11835
 2026-08-11 09:50:02,Sell (B+),IOC,NSE,139.91
 2026-08-11 09:50:04,Sell (E),BHEL,NSE,405.15
+2026-08-11 09:50:06,Sell (B+),PNB,NSE,112.38
