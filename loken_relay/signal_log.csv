@@ -78,3 +78,4 @@ timestamp_ist,signal,ticker,exchange,price,alert_time
 2026-08-11 09:20:08,Buy (B),COFORGE,NSE,1831.8
 2026-08-11 09:20:10,Buy (B+),ONGC,NSE,242.25
 2026-08-11 09:20:12,Buy (A, B, C+),HCLTECH,NSE,1376.1
+2026-08-11 09:20:13,Sell (B+),NBCC,NSE,94
