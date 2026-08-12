@@ -133,3 +133,4 @@ timestamp_ist,signal,ticker,exchange,price,alert_time
 2026-08-12 09:20:01,Buy (C+),HINDALCO,NSE,1087.1
 2026-08-12 09:20:04,Buy (C+),NATIONALUM,NSE,416.25
 2026-08-12 09:20:06,Sell (B+),HDFCBANK,NSE,725
+2026-08-12 09:20:08,Sell (A++),CDSL,NSE,1337.4
