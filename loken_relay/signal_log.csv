@@ -146,3 +146,4 @@ timestamp_ist,signal,ticker,exchange,price,alert_time
 2026-08-12 09:20:27,Sell (A++),LTM,NSE,4809.8
 2026-08-12 09:20:29,Sell (B+),CNXFMCG,NSE,48525.55
 2026-08-12 09:20:31,Sell (A+, A, B+),NIFTY_CONSR_DURBL,NSE,40144.95
+2026-08-12 09:20:33,Sell (B+),CNXREALTY,NSE,883
