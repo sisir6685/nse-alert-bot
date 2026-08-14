@@ -167,3 +167,4 @@ timestamp_ist,signal,ticker,exchange,price,alert_time
 2026-08-13 09:30:15,Sell (A+, A, B+),CNXMETAL,NSE,13097.3
 2026-08-14 09:20:01,Sell (A++),NIFTY_MS_IT_TELCM,NSE,9996.6
 2026-08-14 09:20:03,Sell (B+),CNXMETAL,NSE,12886.25
+2026-08-14 09:20:05,Sell (B+),CNXAUTO,NSE,29235.15
