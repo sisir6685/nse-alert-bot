@@ -1,8 +1,30 @@
 """
-NSE Signal Alert Bot  v3.2  (Fyers API edition — BUY/SELL only)
+NSE Signal Alert Bot  v3.3  (Fyers API edition — Nifty-trend gated)
 =================================================
 Runs as a single scan per invocation, triggered on a schedule by
 GitHub Actions (.github/workflows/scan.yml) — no server, no PC needed.
+
+v3.3 change log (from v3.2) — added a NIFTY momentum gate after
+cross-checking several days of signal_log.csv against Nifty's own
+5-min chart at signal time:
+  - On days where Nifty was flat/falling, SELL signals had a solid
+    hit rate. On the one day Nifty rallied sharply mid-session, every
+    single SELL signal that day failed (price reversed against the
+    signal). The individual stock's own option-chain setup wasn't
+    the problem — the broad index move overran it.
+  - Fix: track NIFTY's own spot price across scans (persisted in
+    state.json) and compute a short-term trend (UP / DOWN / FLAT)
+    each run. A BUY is suppressed if Nifty is trending DOWN; a SELL
+    is suppressed if Nifty is trending UP. Signals that pass their
+    own PCR/score bar but get blocked by this gate are still logged
+    to signal_log.csv (as "BUY-SKIPPED-NIFTY" / "SELL-SKIPPED-NIFTY")
+    so you can verify the filter's behavior directly in GitHub —
+    but they do NOT send a Telegram alert, since they're the ones
+    we're trying to filter out.
+  - NIFTY_TREND_THRESHOLD_PCT and NIFTY_TREND_LOOKBACK_MIN are best
+    first-guess values (0.15% over 30 min) — tune these once you
+    have a few weeks of BUY-SKIPPED / SELL-SKIPPED rows to compare
+    against what actually happened to those symbols afterward.
 
 v3.2 change log (from v3.1) — thresholds recalibrated against a 12-day
 historical backtest of signal_log.csv to target ~5 signals/day per side:
@@ -90,6 +112,14 @@ FYERS_REDIRECT_URI = os.environ.get("FYERS_REDIRECT_URI", "http://127.0.0.1:8080
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 LOG_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "signal_log.csv")
 
+# ── Nifty trend gate settings (v3.3) ──────────────────────────────────────
+# A BUY is suppressed while Nifty is trending DOWN; a SELL is suppressed
+# while Nifty is trending UP. Tune these once you have a few weeks of
+# BUY-SKIPPED-NIFTY / SELL-SKIPPED-NIFTY rows in signal_log.csv to check
+# against what those symbols actually did afterward.
+NIFTY_TREND_LOOKBACK_MIN = 30      # how far back to compare Nifty's spot
+NIFTY_TREND_THRESHOLD_PCT = 0.15   # % move over that window to call it "trending"
+
 # ── F&O Symbols to monitor ────────────────────────────────────────────────────
 FO_STOCKS = [
     "NIFTY","BANKNIFTY","FINNIFTY","MIDCPNIFTY","NIFTYNXT50","BSE","RELIANCE","SBIN","ADANIENT","HDFCBANK",
@@ -142,6 +172,33 @@ def save_state(state):
             json.dump(state, f)
     except Exception as e:
         print(f"[STATE] Save error: {e}")
+
+# ── Nifty trend tracking (v3.3, persisted across runs via state.json) ────
+def update_nifty_trend(state, nifty_spot):
+    """
+    Records NIFTY's spot price with a timestamp under state["_nifty_history"],
+    and returns a trend label: 'UP', 'DOWN', or 'FLAT', based on NIFTY's own
+    move over the last NIFTY_TREND_LOOKBACK_MIN minutes.
+    """
+    now_ts = now_ist().timestamp()
+    history = state.setdefault("_nifty_history", [])
+
+    # Prune anything older than the lookback window
+    cutoff = now_ts - NIFTY_TREND_LOOKBACK_MIN * 60
+    history[:] = [h for h in history if h["ts"] >= cutoff]
+
+    trend = "FLAT"
+    if history:
+        oldest_spot = history[0]["spot"]
+        if oldest_spot:
+            pct_move = (nifty_spot - oldest_spot) / oldest_spot * 100
+            if pct_move >= NIFTY_TREND_THRESHOLD_PCT:
+                trend = "UP"
+            elif pct_move <= -NIFTY_TREND_THRESHOLD_PCT:
+                trend = "DOWN"
+
+    history.append({"ts": now_ts, "spot": nifty_spot})
+    return trend
 
 # ── Signal frequency log (CSV, newest signal always inserted right after
 # the header row, so today's signals show at the TOP instead of the bottom) ──
@@ -381,8 +438,8 @@ def send(msg):
         print(f"[TG] Error: {e}")
         return False
 
-# ── Check and alert (v3.1: BUY / SELL only — CORE and COIL removed) ──────────
-def check_and_alert(d, active_signals):
+# ── Check and alert (v3.3: BUY / SELL, gated by Nifty trend) ─────────────────
+def check_and_alert(d, active_signals, nifty_trend):
     sym = d["sym"]
     now = now_ist().strftime("%H:%M")
 
@@ -391,19 +448,28 @@ def check_and_alert(d, active_signals):
         key = f"BULL_{sym}"
         if active_signals.get(key) != "BULL":
             active_signals[key] = "BULL"
-            msg = (
-                f"⚡ <b>BUY SIGNAL — {sym}</b>\n\n"
-                f"🕐 {now}  |  💰 CMP: ₹{d['cmp']}\n"
-                f"📊 PCR: {d['pcr']}  |  Score: {d['score']}/100\n"
-                f"🎯 MaxPain: ₹{d['maxPain']}  ({d['mpGap']:+.1f}%)\n"
-                f"🛡️ S1: ₹{d['s1']}  |  🎯 R1: ₹{d['r1']}\n"
-                f"🧱 PeWall: {d['peWall']} strikes\n\n"
-                f"✅ <b>CE Short Cover + PE Short Build fired</b>\n"
-                f"<i>Institutional floor confirmed</i>"
-            )
-            send(msg)
-            print(f"[ALERT] BUY — {sym} @ {d['cmp']}")
-            log_signal("BUY", d)
+
+            if nifty_trend == "DOWN":
+                # Passed its own criteria, but Nifty is fighting it — log it
+                # for visibility (so you can verify the filter's calls) but
+                # don't send a Telegram alert for it.
+                print(f"[SKIP] BUY {sym} @ {d['cmp']} — Nifty trending DOWN")
+                log_signal("BUY-SKIPPED-NIFTY", d)
+            else:
+                msg = (
+                    f"⚡ <b>BUY SIGNAL — {sym}</b>\n\n"
+                    f"🕐 {now}  |  💰 CMP: ₹{d['cmp']}\n"
+                    f"📊 PCR: {d['pcr']}  |  Score: {d['score']}/100\n"
+                    f"🎯 MaxPain: ₹{d['maxPain']}  ({d['mpGap']:+.1f}%)\n"
+                    f"🛡️ S1: ₹{d['s1']}  |  🎯 R1: ₹{d['r1']}\n"
+                    f"🧱 PeWall: {d['peWall']} strikes\n"
+                    f"📈 Nifty trend: {nifty_trend}\n\n"
+                    f"✅ <b>CE Short Cover + PE Short Build fired</b>\n"
+                    f"<i>Institutional floor confirmed</i>"
+                )
+                send(msg)
+                print(f"[ALERT] BUY — {sym} @ {d['cmp']}")
+                log_signal("BUY", d)
     else:
         active_signals.pop(f"BULL_{sym}", None)
 
@@ -412,19 +478,28 @@ def check_and_alert(d, active_signals):
         key = f"BEAR_{sym}"
         if active_signals.get(key) != "BEAR":
             active_signals[key] = "BEAR"
-            msg = (
-                f"🔻 <b>SELL SIGNAL — {sym}</b>\n\n"
-                f"🕐 {now}  |  💰 CMP: ₹{d['cmp']}\n"
-                f"📊 PCR: {d['pcr']}  |  Score: {d['score']}/100\n"
-                f"🎯 MaxPain: ₹{d['maxPain']}  ({d['mpGap']:+.1f}%)\n"
-                f"🛡️ R1: ₹{d['r1']}  |  🎯 S1: ₹{d['s1']}\n"
-                f"🧱 CeWall: {d['ceSBCount']} strikes\n\n"
-                f"✅ <b>CE Short Build + PE Short Cover fired</b>\n"
-                f"<i>Institutional ceiling confirmed</i>"
-            )
-            send(msg)
-            print(f"[ALERT] SELL — {sym} @ {d['cmp']}")
-            log_signal("SELL", d)
+
+            if nifty_trend == "UP":
+                # Passed its own criteria, but Nifty is fighting it — log it
+                # for visibility (so you can verify the filter's calls) but
+                # don't send a Telegram alert for it.
+                print(f"[SKIP] SELL {sym} @ {d['cmp']} — Nifty trending UP")
+                log_signal("SELL-SKIPPED-NIFTY", d)
+            else:
+                msg = (
+                    f"🔻 <b>SELL SIGNAL — {sym}</b>\n\n"
+                    f"🕐 {now}  |  💰 CMP: ₹{d['cmp']}\n"
+                    f"📊 PCR: {d['pcr']}  |  Score: {d['score']}/100\n"
+                    f"🎯 MaxPain: ₹{d['maxPain']}  ({d['mpGap']:+.1f}%)\n"
+                    f"🛡️ R1: ₹{d['r1']}  |  🎯 S1: ₹{d['s1']}\n"
+                    f"🧱 CeWall: {d['ceSBCount']} strikes\n"
+                    f"📉 Nifty trend: {nifty_trend}\n\n"
+                    f"✅ <b>CE Short Build + PE Short Cover fired</b>\n"
+                    f"<i>Institutional ceiling confirmed</i>"
+                )
+                send(msg)
+                print(f"[ALERT] SELL — {sym} @ {d['cmp']}")
+                log_signal("SELL", d)
     else:
         active_signals.pop(f"BEAR_{sym}", None)
 
@@ -441,7 +516,7 @@ def is_market_open():
 # ── Single scan (one run of this script = one scan) ──────────────────────────
 def run():
     print("=" * 55)
-    print("  NSE Signal Alert Bot  v3.2 (Fyers API edition — BUY/SELL only)")
+    print("  NSE Signal Alert Bot  v3.3 (Fyers API edition — Nifty-trend gated)")
     print("=" * 55)
     print(f"  Symbols: {len(FO_STOCKS)}")
     print(f"  Telegram: {'configured' if TELEGRAM_TOKEN != 'YOUR_BOT_TOKEN' else 'NOT SET'}")
@@ -468,6 +543,21 @@ def run():
         "analysed_ok": 0, "analysed_none": 0,
         "any_ce_sc": 0, "any_pe_sb": 0, "any_ce_sb": 0, "any_pe_sc": 0,
     }
+
+    # ── Compute Nifty's own trend FIRST, before scanning the rest (v3.3) ──
+    # This determines whether BUY/SELL signals on individual stocks get
+    # gated later in the loop.
+    nifty_trend = "FLAT"
+    try:
+        nifty_data = fetch_option_chain(fyers, "NIFTY")
+        if nifty_data:
+            nifty_result = analyse("NIFTY", nifty_data)
+            if nifty_result:
+                nifty_trend = update_nifty_trend(active_signals, nifty_result["cmp"])
+    except Exception as e:
+        print(f"[INDEX] Nifty trend check failed, defaulting to FLAT: {e}")
+    print(f"[INDEX] Nifty trend this scan: {nifty_trend}")
+
     print(f"[{now_ist().strftime('%H:%M:%S')}] Scanning {len(FO_STOCKS)} symbols...")
 
     for sym in FO_STOCKS:
@@ -482,7 +572,7 @@ def run():
                     if result["hasPESB"]: diag["any_pe_sb"] += 1
                     if result["hasCESB"]: diag["any_ce_sb"] += 1
                     if result["hasPESC"]: diag["any_pe_sc"] += 1
-                    check_and_alert(result, active_signals)
+                    check_and_alert(result, active_signals, nifty_trend)
                 else:
                     diag["analysed_none"] += 1
             else:
