@@ -143,18 +143,31 @@ def save_state(state):
     except Exception as e:
         print(f"[STATE] Save error: {e}")
 
-# ── Signal frequency log (CSV, appended every fired alert) ───────────────────
+# ── Signal frequency log (CSV, newest signal always inserted right after
+# the header row, so today's signals show at the TOP instead of the bottom) ──
+HEADER_ROW = ["timestamp_ist", "signal", "symbol", "cmp", "pcr", "score", "maxPain", "mpGap"]
+
 def log_signal(signal_type, d):
     try:
-        is_new = not os.path.exists(LOG_FILE)
-        with open(LOG_FILE, "a", newline="") as f:
+        new_row = [
+            now_ist().strftime("%Y-%m-%d %H:%M:%S"),
+            signal_type, d["sym"], d["cmp"], d["pcr"], d["score"], d["maxPain"], d["mpGap"],
+        ]
+
+        existing_rows = []
+        if os.path.exists(LOG_FILE):
+            with open(LOG_FILE, "r", newline="") as f:
+                rows = list(csv.reader(f))
+                if rows:
+                    # rows[0] is the old header; every row after it is
+                    # already newest-first from prior runs, so keep as-is.
+                    existing_rows = rows[1:]
+
+        with open(LOG_FILE, "w", newline="") as f:
             writer = csv.writer(f)
-            if is_new:
-                writer.writerow(["timestamp_ist", "signal", "symbol", "cmp", "pcr", "score", "maxPain", "mpGap"])
-            writer.writerow([
-                now_ist().strftime("%Y-%m-%d %H:%M:%S"),
-                signal_type, d["sym"], d["cmp"], d["pcr"], d["score"], d["maxPain"], d["mpGap"],
-            ])
+            writer.writerow(HEADER_ROW)
+            writer.writerow(new_row)
+            writer.writerows(existing_rows)
     except Exception as e:
         print(f"[LOG] Error: {e}")
 
