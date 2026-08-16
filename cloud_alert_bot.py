@@ -228,6 +228,118 @@ def log_signal(signal_type, d):
     except Exception as e:
         print(f"[LOG] Error: {e}")
 
+# ── OI daily tracking log (v3.4, NEW) ─────────────────────────────────────
+# Tracks, per symbol, a rolling 2-day snapshot of combined option-chain OI
+# (CE total + PE total, from analyse()) and spot price, persisted across
+# runs under state["_oi_daily"][sym]. Since GitHub Actions runs this
+# script repeatedly during market hours, each symbol's "d1" slot is
+# refreshed with the LATEST value on every scan of the current day (so by
+# the last scan before close, it holds end-of-day figures, matching how
+# NSE's own "Change in Open Interest" report and the Pine dashboard's OI
+# tracker both compare day-over-day CLOSE values, not intraday ticks).
+#
+# The first scan of a NEW day is what actually produces a log row: at
+# that point we know (a) the OI/price change on the prior day (comparing
+# its own d1 vs the d2 snapshot from the day before that), AND (b) we can
+# immediately compute the "outcome" — today's opening/current price vs
+# that prior day's close — since today's price is already in hand. So
+# every row written to oi_tracking_log.csv is complete on arrival; there
+# is no separate "come back and fill in the outcome later" step.
+#
+# NOTE ON DATA SOURCE: this uses combined OPTIONS-CHAIN OI (CE+PE totals,
+# already computed in analyse() for the PCR calculation — zero extra
+# Fyers API calls), not the underlying's FUTURES open interest specifically.
+# It's a reasonable proxy and uses the same PCR data your BUY/SELL signals
+# already rely on, but it is a different number than a single futures-
+# contract OI figure (e.g. what the "NSE:<SYM>1!_OI" ticker gives you on
+# the TradingView side). If you want true futures OI here too, that would
+# need one additional Fyers API call per symbol per scan.
+OI_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "oi_tracking_log.csv")
+OI_HEADER_ROW = ["date", "symbol", "oi_pct_change", "price_pct_change", "classification", "next_day_price_change_pct"]
+
+def classify_oi(price_pct, oi_pct):
+    """Standard 2x2 price+OI classification. Returns 'N/A' if either
+    input is missing (e.g. a symbol's OI or price was 0/unavailable that
+    day, so a % change couldn't be computed)."""
+    if price_pct is None or oi_pct is None:
+        return "N/A"
+    if price_pct > 0 and oi_pct > 0:
+        return "Long Buildup"
+    if price_pct < 0 and oi_pct > 0:
+        return "Short Buildup"
+    if price_pct > 0 and oi_pct < 0:
+        return "Short Covering"
+    if price_pct < 0 and oi_pct < 0:
+        return "Long Unwinding"
+    return "Flat"
+
+def log_oi_row(date_str, sym, oi_pct, price_pct, classification, outcome_pct):
+    try:
+        new_row = [
+            date_str, sym,
+            "" if oi_pct is None else round(oi_pct, 3),
+            "" if price_pct is None else round(price_pct, 3),
+            classification,
+            "" if outcome_pct is None else round(outcome_pct, 3),
+        ]
+
+        existing_rows = []
+        if os.path.exists(OI_LOG_FILE):
+            with open(OI_LOG_FILE, "r", newline="") as f:
+                rows = list(csv.reader(f))
+                if rows:
+                    existing_rows = rows[1:]
+
+        with open(OI_LOG_FILE, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(OI_HEADER_ROW)
+            writer.writerow(new_row)
+            writer.writerows(existing_rows)
+    except Exception as e:
+        print(f"[OI-LOG] Error: {e}")
+
+def track_oi_history(state, sym, combined_oi, spot):
+    """Updates state["_oi_daily"][sym]'s rolling 2-day snapshot, and — on
+    the first scan of a new trading day for this symbol — logs the
+    completed prior-day row (OI% change, price% change, classification,
+    and the outcome that followed it) to oi_tracking_log.csv."""
+    if not combined_oi or not spot:
+        return
+
+    today_str = now_ist().strftime("%Y-%m-%d")
+    daily = state.setdefault("_oi_daily", {})
+    entry = daily.get(sym)
+
+    if entry is None:
+        # First time ever seeing this symbol — seed d1, nothing to log yet.
+        daily[sym] = {"d1_date": today_str, "d1_oi": combined_oi, "d1_price": spot}
+        return
+
+    if entry.get("d1_date") == today_str:
+        # Same trading day — just refresh d1 with the latest values so it
+        # approaches the end-of-day figure by the last scan before close.
+        entry["d1_oi"] = combined_oi
+        entry["d1_price"] = spot
+        return
+
+    # New day detected — entry currently holds what was "today" as of the
+    # last run, i.e. it's now the completed PRIOR day.
+    if "d2_date" in entry and entry.get("d2_oi") and entry.get("d2_price"):
+        d1_oi, d1_price = entry["d1_oi"], entry["d1_price"]
+        d2_oi, d2_price = entry["d2_oi"], entry["d2_price"]
+        oi_pct    = (d1_oi - d2_oi) / d2_oi * 100 if d2_oi else None
+        price_pct = (d1_price - d2_price) / d2_price * 100 if d2_price else None
+        outcome_pct = (spot - d1_price) / d1_price * 100 if d1_price else None
+        classification = classify_oi(price_pct, oi_pct)
+        log_oi_row(entry["d1_date"], sym, oi_pct, price_pct, classification, outcome_pct)
+
+    # Shift the rolling window: today's incoming snapshot becomes the new
+    # d1; the old d1 becomes d2.
+    daily[sym] = {
+        "d2_date": entry.get("d1_date"), "d2_oi": entry.get("d1_oi"), "d2_price": entry.get("d1_price"),
+        "d1_date": today_str, "d1_oi": combined_oi, "d1_price": spot,
+    }
+
 # ── Fyers automated login (TOTP + PIN, no browser) ────────────────────────
 def _totp(key, time_step=30, digits=6, digest="sha1"):
     key = base64.b32decode(key.upper() + "=" * ((8 - len(key)) % 8))
@@ -421,6 +533,10 @@ def analyse(sym, resp):
             "hasCESC": len(ce_sc) >= 2, "hasPESB": len(pe_sb) >= 2,
             "hasCESB": len(ce_sb) >= 2, "hasPESC": len(pe_sc) >= 2,
             "ceSBCount": len(ce_sb), "peSBCount": len(pe_sb),
+            # v3.4: combined CE+PE total OI, exposed so track_oi_history()
+            # can log day-over-day OI% change without any extra API calls.
+            "ceOiTotal": ce_oi_total, "peOiTotal": pe_oi_total,
+            "combinedOi": ce_oi_total + pe_oi_total,
         }
     except Exception:
         return None
@@ -516,7 +632,7 @@ def is_market_open():
 # ── Single scan (one run of this script = one scan) ──────────────────────────
 def run():
     print("=" * 55)
-    print("  NSE Signal Alert Bot  v3.3 (Fyers API edition — Nifty-trend gated)")
+    print("  NSE Signal Alert Bot  v3.4 (Fyers API edition — Nifty-trend gated + OI tracking)")
     print("=" * 55)
     print(f"  Symbols: {len(FO_STOCKS)}")
     print(f"  Telegram: {'configured' if TELEGRAM_TOKEN != 'YOUR_BOT_TOKEN' else 'NOT SET'}")
@@ -573,6 +689,7 @@ def run():
                     if result["hasCESB"]: diag["any_ce_sb"] += 1
                     if result["hasPESC"]: diag["any_pe_sc"] += 1
                     check_and_alert(result, active_signals, nifty_trend)
+                    track_oi_history(active_signals, sym, result["combinedOi"], result["cmp"])
                 else:
                     diag["analysed_none"] += 1
             else:
