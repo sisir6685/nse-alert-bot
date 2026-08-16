@@ -1,5 +1,4 @@
 name: NSE Signal Scan
-
 on:
   schedule:
     # Every 5 min, 03:45-10:05 UTC (09:15-15:35 IST), Mon-Fri.
@@ -7,28 +6,22 @@ on:
     # immediately via is_market_open()).
     - cron: "*/5 3-10 * * 1-5"
   workflow_dispatch: {}
-
 permissions:
   contents: write
-
 concurrency:
   group: nse-scan
   cancel-in-progress: false
-
 jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 4
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Install dependencies
         run: pip install -r requirements.txt
-
       - name: Run scan
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -40,12 +33,11 @@ jobs:
           FYERS_SECRET_ID: ${{ secrets.FYERS_SECRET_ID }}
           FYERS_REDIRECT_URI: ${{ secrets.FYERS_REDIRECT_URI }}
         run: python cloud_alert_bot.py
-
       - name: Commit updated state
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add state.json signal_log.csv
+          git add state.json signal_log.csv oi_tracking_log.csv
           if ! git diff --cached --quiet; then
             git commit -m "Update signal state [skip ci]"
             git push
